@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https://api.github.com; img-src data:; form-action 'none'; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https://api.github.com; img-src data: blob:; form-action 'none'; base-uri 'none'">
 <title>우리집 진료수첩</title>
 <style>
 :root{
@@ -83,6 +83,19 @@ h2{font-size:14px;margin:22px 0 8px;color:var(--sub)}
 .who .chip{padding:7px 14px}
 .actions{display:flex;gap:8px;margin-top:20px}
 .actions .btn{flex:1}
+.thumbs{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center}
+.thumb{width:64px;height:64px;border-radius:8px;object-fit:cover;background:var(--chip);border:1px solid var(--line);display:block;cursor:zoom-in}
+.pick{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+.pick .thumb{width:80px;height:80px}
+.pitem{position:relative}
+.pitem .x{position:absolute;top:-7px;right:-7px;width:24px;height:24px;border-radius:50%;border:0;background:rgba(0,0,0,.7);color:#fff;font-size:13px;line-height:24px;padding:0}
+.addph{width:80px;height:80px;border:1.5px dashed var(--line);border-radius:8px;background:transparent;color:var(--sub);font-size:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
+.addph b{font-size:22px;font-weight:400}
+#viewer{position:fixed;inset:0;background:#000;z-index:40;overflow:auto;display:flex;align-items:center;justify-content:center}
+#viewer img{max-width:100%;max-height:100vh;cursor:zoom-in}
+#viewer.zoom{display:block} #viewer.zoom img{max-width:none;max-height:none;cursor:zoom-out}
+#viewer .close{position:fixed;top:calc(12px + env(safe-area-inset-top));right:12px;width:40px;height:40px;border-radius:50%;border:0;background:rgba(255,255,255,.2);color:#fff;font-size:20px;z-index:1}
+#viewer .vhint{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));left:0;right:0;text-align:center;color:#ccc;font-size:12px}
 .toast{position:fixed;left:50%;bottom:92px;transform:translateX(-50%);background:#222;color:#fff;padding:9px 16px;border-radius:10px;font-size:14px;z-index:30;max-width:90vw}
 </style>
 </head>
@@ -111,6 +124,7 @@ h2{font-size:14px;margin:22px 0 8px;color:var(--sub)}
 </div>
 
 <div id="modal" class="hidden"><div class="sheet" id="sheet"></div></div>
+<div id="viewer" class="hidden"></div>
 
 <script>
 'use strict';
@@ -177,6 +191,87 @@ async function remotePut(blob, sha){
   return (await res.json()).content.sha;
 }
 
+/* ===== 사진 (사진마다 무작위 키로 암호화 → photos/<id>.bin, 키는 암호화된 기록 안에 보관) ===== */
+const PHOTO_URL = id => `https://api.github.com/repos/${CONF.owner}/${CONF.repo}/contents/photos/${id}.bin`;
+const PHOTO_CACHE = new Map();
+async function photoPut(id, bytes){
+  if (MOCK){ lsSet('hl_ph_' + id, b64(bytes)); if (lsGet('hl_ph_' + id) == null) throw new Error('mock full'); return; }
+  for (let i = 0; i < 3; i++){
+    const res = await fetch(PHOTO_URL(id), {method:'PUT', headers:{...headers(),'Content-Type':'application/json'},
+      body:JSON.stringify({message:'photo', content:b64(bytes), branch:CONF.branch})});
+    if (res.ok) return;
+    if (res.status === 409 && i < 2) continue;
+    const e = new Error('PUT ' + res.status); e.status = res.status; throw e;
+  }
+}
+async function photoGet(id){
+  if (MOCK){ const s = lsGet('hl_ph_' + id); if (!s) throw new Error('404'); return unb64(s); }
+  const res = await fetch(PHOTO_URL(id) + '?ref=' + CONF.branch, {headers:{...headers(), Accept:'application/vnd.github.raw'}});
+  if (!res.ok) throw new Error('GET ' + res.status);
+  return new Uint8Array(await res.arrayBuffer());
+}
+async function photoDel(id){
+  try{
+    if (MOCK) return lsSet('hl_ph_' + id, null);
+    const r = await fetch(PHOTO_URL(id) + '?ref=' + CONF.branch, {headers:headers(), cache:'no-store'});
+    if (!r.ok) return;
+    const {sha} = await r.json();
+    await fetch(PHOTO_URL(id), {method:'DELETE', headers:{...headers(),'Content-Type':'application/json'},
+      body:JSON.stringify({message:'remove photo', sha, branch:CONF.branch})});
+  }catch(e){}
+}
+async function sealPhoto(bytes){
+  const raw = crypto.getRandomValues(new Uint8Array(32)), iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, bytes));
+  const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12);
+  return {k:b64(raw), bytes:out};
+}
+function openPhoto(ref){
+  if (PHOTO_CACHE.has(ref.id)) return PHOTO_CACHE.get(ref.id);
+  const p = (async () => {
+    const data = await photoGet(ref.id);
+    const key = await crypto.subtle.importKey('raw', unb64(ref.k), 'AES-GCM', false, ['decrypt']);
+    const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv:data.slice(0,12)}, key, data.slice(12));
+    return URL.createObjectURL(new Blob([pt], {type:'image/jpeg'}));
+  })();
+  PHOTO_CACHE.set(ref.id, p); p.catch(() => PHOTO_CACHE.delete(ref.id));
+  return p;
+}
+/* 휴대폰 사진(수 MB)을 긴 변 1600px JPEG로 줄임 — 약봉지 글씨는 충분히 읽힘 */
+async function compress(file){
+  const url = URL.createObjectURL(file);
+  try{
+    const img = new Image(); img.src = url; await img.decode();
+    const s = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.naturalWidth * s); c.height = Math.round(img.naturalHeight * s);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    return await new Promise((ok, no) => c.toBlob(b => b ? ok(b) : no(new Error('toBlob')), 'image/jpeg', 0.75));
+  }finally{ URL.revokeObjectURL(url); }
+}
+function findRef(id){
+  for (const col of ['visits','meds']) for (const x of S.data[col]) for (const p of (x.photos||[])) if (p.id === id) return p;
+  return null;
+}
+const thumbsHtml = (photos, max = 4) => photos?.length ? `<div class="thumbs">${photos.slice(0,max).map(p => `<img class="thumb" data-ph="${h(p.id)}" alt="">`).join('')}${photos.length > max ? `<span class="meta">+${photos.length-max}</span>` : ''}</div>` : '';
+function hydrate(root, refs){
+  root.querySelectorAll('img[data-ph]').forEach(img => {
+    const ref = (refs && refs.find(p => p.id === img.dataset.ph)) || findRef(img.dataset.ph); if (!ref) return;
+    openPhoto(ref).then(u => img.src = u).catch(() => img.alt = '⚠️');
+    img.onclick = e => { e.stopPropagation(); viewPhoto(ref); };
+  });
+}
+function viewPhoto(ref){
+  const v = $('#viewer');
+  v.innerHTML = `<button class="close" aria-label="닫기">✕</button><img alt=""><div class="vhint">사진을 누르면 확대/축소</div>`;
+  v.className = '';
+  const img = v.querySelector('img');
+  (ref.url ? Promise.resolve(ref.url) : openPhoto(ref)).then(u => img.src = u);
+  img.onclick = () => v.classList.toggle('zoom');
+  v.querySelector('.close').onclick = () => { v.className = 'hidden'; v.innerHTML = ''; };
+}
+
 /* ===== 데이터 / 동기화 ===== */
 const S = { key:null, salt:null, iter:ITER, data:null, sha:null, dirty:false, syncing:false, again:false, who:'all', tab:'visits' };
 const emptyData = () => ({version:2, settings:{token:'', updatedAt:0}, visits:[], meds:[]});
@@ -241,7 +336,11 @@ function upsert(col, obj){
   if (i >= 0) S.data[col][i] = obj; else S.data[col].push(obj);
   S.dirty = true; saveLocal(); render(); sync();
 }
-function remove(col, id){ upsert(col, {id, deleted:true}); }
+function remove(col, id){
+  const it = S.data[col].find(x => x.id === id);
+  (it?.photos || []).forEach(p => photoDel(p.id));
+  upsert(col, {id, deleted:true});
+}
 
 /* ===== 잠금 / 처음 설정 ===== */
 let REMOTE = null, CACHE = null;
@@ -342,6 +441,7 @@ function render(){
   $('#main').innerHTML = S.tab === 'meds' ? viewMeds() : viewVisits();
   $('#main').querySelectorAll('[data-v]').forEach(el => el.onclick = () => editVisit({...S.data.visits.find(x => x.id === el.dataset.v)}));
   $('#main').querySelectorAll('[data-m]').forEach(el => el.onclick = () => editMed({...S.data.meds.find(x => x.id === el.dataset.m)}));
+  hydrate($('#main'));
 }
 
 function viewVisits(){
@@ -352,21 +452,21 @@ function viewVisits(){
   if (next.length){
     html += `<h2>📅 다가오는 예약</h2>` + next.map(v => { const d = dday(v.next);
       return `<div class="card" data-v="${h(v.id)}"><div class="row"><span class="badge warn">${d ? 'D-'+d : '오늘'}</span>
-        <b>${fmt(v.next)}</b><span class="grow">${h(v.place)}</span>${whoBadge(v)}</div></div>`; }).join('');
+        <b>${fmt(v.next)}</b><span class="grow">${h(v.place || '진료')}</span>${whoBadge(v)}</div></div>`; }).join('');
     html += `<h2>지난 진료</h2>`;
   }
   if (!list.length) return html + `<div class="empty">아직 진료 기록이 없어요.<br>＋ 버튼으로 추가하세요.</div>`;
   return html + list.map(v => `<div class="card" data-v="${h(v.id)}">
-    <div class="row"><span class="meta">${fmt(v.date)}</span>${whoBadge(v)}<span class="title grow">${h(v.place)}</span></div>
-    ${v.note ? `<div class="body">${h(v.note.length > 90 ? v.note.slice(0,90) + '…' : v.note)}</div>` : ''}</div>`).join('');
+    <div class="row"><span class="meta">${fmt(v.date)}</span>${whoBadge(v)}<span class="title grow">${h(v.place || '진료')}</span></div>
+    ${v.note ? `<div class="body">${h(v.note.length > 90 ? v.note.slice(0,90) + '…' : v.note)}</div>` : ''}${thumbsHtml(v.photos)}</div>`).join('');
 }
 
 function viewMeds(){
   const all = mine(live('meds')).sort((a,b) => (b.updatedAt||0) - (a.updatedAt||0));
   const now = all.filter(m => !m.done), past = all.filter(m => m.done);
   const card = m => `<div class="card ${m.done?'past':''}" data-m="${h(m.id)}">
-    <div class="row"><span class="title grow">${h(m.name)}</span>${whoBadge(m)}</div>
-    ${m.how ? `<div class="body">${h(m.how)}</div>` : ''}</div>`;
+    <div class="row"><span class="title grow">${h(m.name || '약봉지 사진')}</span>${m.date ? `<span class="meta">${fmt(m.date)}</span>` : ''}${whoBadge(m)}</div>
+    ${m.how ? `<div class="body">${h(m.how)}</div>` : ''}${thumbsHtml(m.photos)}</div>`;
   if (!all.length) return `<div class="empty">등록된 약이 없어요.<br>＋ 버튼으로 추가하세요.</div>`;
   return `<h2>지금 먹는 약 (${now.length})</h2>` + (now.length ? now.map(card).join('') : `<div class="empty">없음</div>`)
     + (past.length ? `<h2>예전에 먹은 약</h2>` + past.map(card).join('') : '');
@@ -374,21 +474,68 @@ function viewMeds(){
 
 /* ===== 입력 ===== */
 function whoPicker(cur){ return `<label>누구</label><div class="who" id="who">${FAMILY.map(n => `<button type="button" class="chip ${cur===n?'on':''}" data-n="${h(n)}">${h(n)}</button>`).join('')}</div>`; }
+const photoSection = label => `<label>${label}</label><div class="pick" id="pick"></div>
+  <input type="file" id="cam" accept="image/*" capture="environment" hidden><input type="file" id="gal" accept="image/*" multiple hidden>`;
+
 function openSheet(title, obj, col, inner, read){
   $('#sheet').innerHTML = `<h3>${h(title)}</h3><form id="ff">${whoPicker(obj.who)}${inner}<div class="err" id="ferr"></div>
     <div class="actions">${obj.id ? '<button type="button" class="btn danger" id="del">삭제</button>' : ''}
-    <button type="button" class="btn" id="cancel">취소</button><button class="btn pri">저장</button></div></form>`;
+    <button type="button" class="btn" id="cancel">취소</button><button class="btn pri" id="save">저장</button></div></form>`;
   $('#modal').classList.remove('hidden');
   let who = obj.who || '';
   $('#who').onclick = e => { const c = e.target.closest('.chip'); if (!c) return; who = c.dataset.n; $('#who').querySelectorAll('.chip').forEach(x => x.classList.toggle('on', x === c)); };
   $('#cancel').onclick = closeModal;
-  if (obj.id) $('#del').onclick = () => { if (confirm('삭제할까요?')){ remove(col, obj.id); closeModal(); toast('삭제했어요'); } };
-  $('#ff').onsubmit = ev => {
+  if (obj.id) $('#del').onclick = () => { if (confirm('삭제할까요? (사진도 함께 삭제돼요)')){ remove(col, obj.id); closeModal(); toast('삭제했어요'); } };
+
+  // 사진: kept = 이미 올라간 사진, added = 이번에 고른 사진(아직 업로드 전)
+  const kept = [...(obj.photos || [])], added = [], removed = [];
+  const renderPick = () => {
+    $('#pick').innerHTML = kept.map((p,i) => `<div class="pitem"><img class="thumb" data-ph="${h(p.id)}" alt=""><button type="button" class="x" data-k="${i}">✕</button></div>`).join('')
+      + added.map((a,i) => `<div class="pitem"><img class="thumb" data-a="${i}" src="${a.url}" alt=""><button type="button" class="x" data-a="${i}">✕</button></div>`).join('')
+      + `<button type="button" class="addph" id="bCam"><b>📷</b>촬영</button><button type="button" class="addph" id="bGal"><b>🖼️</b>앨범</button>`;
+    hydrate($('#pick'), kept);
+    $('#pick').querySelectorAll('img[data-a]').forEach(img => img.onclick = () => viewPhoto({url: added[+img.dataset.a].url}));
+    $('#pick').querySelectorAll('.x').forEach(b => b.onclick = () => {
+      if (b.dataset.k != null) removed.push(...kept.splice(+b.dataset.k, 1));
+      else URL.revokeObjectURL(added.splice(+b.dataset.a, 1)[0].url);
+      renderPick();
+    });
+    $('#bCam').onclick = () => $('#cam').click();
+    $('#bGal').onclick = () => $('#gal').click();
+  };
+  const onFiles = async ev => {
+    const files = [...ev.target.files]; ev.target.value = '';
+    for (const f of files){
+      try{ const blob = await compress(f); added.push({blob, url:URL.createObjectURL(blob)}); }
+      catch(e){ $('#ferr').textContent = '이 사진 형식은 열 수 없어요. 다른 사진을 골라주세요.'; }
+    }
+    renderPick();
+  };
+  $('#cam').onchange = onFiles; $('#gal').onchange = onFiles;
+  renderPick();
+
+  $('#ff').onsubmit = async ev => {
     ev.preventDefault();
-    const msg = !who ? '누구 기록인지 선택해주세요.' : read();
+    const msg = !who ? '누구 기록인지 선택해주세요.' : read(kept.length + added.length);
     if (msg) return $('#ferr').textContent = msg;
-    obj.who = who; if (!obj.id) obj.id = uid();
-    upsert(col, obj); closeModal(); toast('저장했어요');
+    const btn = $('#save'); btn.disabled = true;
+    try{
+      while (added.length){
+        btn.textContent = `사진 올리는 중… (${added.length})`;
+        const a = added[0], id = uid();
+        const sealed = await sealPhoto(new Uint8Array(await a.blob.arrayBuffer()));
+        await photoPut(id, sealed.bytes);
+        kept.push({id, k:sealed.k}); PHOTO_CACHE.set(id, Promise.resolve(a.url));
+        added.shift();
+      }
+    }catch(e){
+      btn.disabled = false; btn.textContent = '저장';
+      return $('#ferr').textContent = '사진 업로드 실패 (' + errText(e) + '). 인터넷 연결을 확인하고 다시 저장해주세요.';
+    }
+    obj.who = who; obj.photos = kept; if (!obj.id) obj.id = uid();
+    if (!obj.photos.length) delete obj.photos;
+    upsert(col, obj); removed.forEach(p => photoDel(p.id));
+    closeModal(); toast('저장했어요');
   };
 }
 function closeModal(){ $('#modal').classList.add('hidden'); $('#sheet').innerHTML = ''; }
@@ -401,17 +548,21 @@ function editVisit(v){
     <label>병원</label><input type="text" id="place" value="${h(v.place)}" placeholder="예: 서울내과 (내과)" list="pl">
     <datalist id="pl">${places.map(p => `<option value="${h(p)}">`).join('')}</datalist>
     <label>진료 내용</label><textarea id="note" placeholder="예: 기침·미열로 방문. 기관지염 진단, 5일치 약 처방">${h(v.note)}</textarea>
-    <label>다음 예약일 (있으면)</label><input type="date" id="next" value="${h(v.next)}">`,
-    () => { v.date = $('#date').value; v.place = $('#place').value.trim(); v.note = $('#note').value.trim(); v.next = $('#next').value;
-            if (!v.place) return '병원을 입력해주세요.'; });
+    <label>다음 예약일 (있으면)</label><input type="date" id="next" value="${h(v.next)}">
+    ${photoSection('사진 (처방전·영수증·검사지 등)')}`,
+    n => { v.date = $('#date').value; v.place = $('#place').value.trim(); v.note = $('#note').value.trim(); v.next = $('#next').value;
+           if (!v.place && !n) return '병원 이름이나 사진 중 하나는 넣어주세요.'; });
 }
 function editMed(m){
   openSheet(m.id ? '약 수정' : '약 추가', m, 'meds', `
-    <label>약 이름</label><input type="text" id="name" value="${h(m.name)}" placeholder="예: 아모디핀정 5mg">
-    <label>먹는 방법 · 메모</label><textarea id="how" style="min-height:70px" placeholder="예: 아침 1알, 혈압약">${h(m.how)}</textarea>
+    ${photoSection('약봉지 · 처방전 사진')}
+    <div class="hint">사진만 올려도 저장돼요. 아래는 적고 싶을 때만 적으세요.</div>
+    <label>약 이름 (선택)</label><input type="text" id="name" value="${h(m.name)}" placeholder="예: 혈압약, 감기약">
+    <label>메모 (선택)</label><textarea id="how" style="min-height:60px" placeholder="예: 아침 1알">${h(m.how)}</textarea>
     <label>상태</label><select id="done"><option value="">지금 먹는 중</option><option value="1" ${m.done?'selected':''}>이제 안 먹음</option></select>`,
-    () => { m.name = $('#name').value.trim(); m.how = $('#how').value.trim(); m.done = !!$('#done').value;
-            if (!m.name) return '약 이름을 입력해주세요.'; });
+    n => { m.name = $('#name').value.trim(); m.how = $('#how').value.trim(); m.done = !!$('#done').value;
+           if (!m.date) m.date = today();
+           if (!m.name && !n) return '약봉지 사진이나 약 이름 중 하나는 넣어주세요.'; });
 }
 
 /* ===== 설정 ===== */
