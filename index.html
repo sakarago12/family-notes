@@ -96,6 +96,21 @@ h2{font-size:14px;margin:22px 0 8px;color:var(--sub)}
 #viewer.zoom{display:block} #viewer.zoom img{max-width:none;max-height:none;cursor:zoom-out}
 #viewer .close{position:fixed;top:calc(12px + env(safe-area-inset-top));right:12px;width:40px;height:40px;border-radius:50%;border:0;background:rgba(255,255,255,.2);color:#fff;font-size:20px;z-index:1}
 #viewer .vhint{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));left:0;right:0;text-align:center;color:#ccc;font-size:12px}
+.rxbox{margin-top:18px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--bg)}
+.rxbox .pick{margin-bottom:4px}
+label.check{display:flex;align-items:center;gap:8px;margin:0;color:var(--text);font-size:15px;font-weight:600;cursor:pointer}
+label.check input{width:20px;height:20px;margin:0;flex:none}
+.showbtn{width:100%;margin-top:14px;background:var(--pri-soft);color:var(--pri)}
+.who.big{margin-top:14px}
+.who.big .chip{flex:1 1 30%;padding:14px 8px;font-size:17px}
+#show{position:fixed;inset:0;background:var(--card);z-index:35;overflow:auto}
+.showin{max-width:640px;margin:0 auto;padding:calc(12px + env(safe-area-inset-top)) 16px 40px;font-size:17px}
+.showin h2{font-size:28px;margin:0;color:var(--text)}
+.showin h3{font-size:18px;margin:24px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--line)}
+.showin .close{width:44px;height:44px;border-radius:50%;border:0;background:var(--chip);font-size:20px}
+.sitem{margin-bottom:18px}
+.stxt{margin-bottom:6px}
+img.big{display:block;width:100%;border-radius:10px;border:1px solid var(--line);margin-bottom:8px;background:var(--chip);min-height:120px;cursor:zoom-in}
 .toast{position:fixed;left:50%;bottom:92px;transform:translateX(-50%);background:#222;color:#fff;padding:9px 16px;border-radius:10px;font-size:14px;z-index:30;max-width:90vw}
 </style>
 </head>
@@ -124,6 +139,7 @@ h2{font-size:14px;margin:22px 0 8px;color:var(--sub)}
 </div>
 
 <div id="modal" class="hidden"><div class="sheet" id="sheet"></div></div>
+<div id="show" class="hidden"></div>
 <div id="viewer" class="hidden"></div>
 
 <script>
@@ -438,7 +454,10 @@ function render(){
   if (!S.data) return;
   $('#chips').innerHTML = ['all', ...FAMILY].map(n => `<button class="chip ${S.who===n?'on':''}" data-who="${h(n)}">${n==='all'?'전체':h(n)}</button>`).join('');
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.tab === S.tab));
-  $('#main').innerHTML = S.tab === 'meds' ? viewMeds() : viewVisits();
+  const hasAny = live('visits').length || live('meds').length;
+  $('#main').innerHTML = (hasAny ? `<button class="btn showbtn" id="bShow">🩺 병원에서 보여주기${S.who === 'all' ? '' : ' — ' + h(S.who)}</button>` : '')
+    + (S.tab === 'meds' ? viewMeds() : viewVisits());
+  if ($('#bShow')) $('#bShow').onclick = askShow;
   $('#main').querySelectorAll('[data-v]').forEach(el => el.onclick = () => editVisit({...S.data.visits.find(x => x.id === el.dataset.v)}));
   $('#main').querySelectorAll('[data-m]').forEach(el => el.onclick = () => editMed({...S.data.meds.find(x => x.id === el.dataset.m)}));
   hydrate($('#main'));
@@ -457,7 +476,7 @@ function viewVisits(){
   }
   if (!list.length) return html + `<div class="empty">아직 진료 기록이 없어요.<br>＋ 버튼으로 추가하세요.</div>`;
   return html + list.map(v => `<div class="card" data-v="${h(v.id)}">
-    <div class="row"><span class="meta">${fmt(v.date)}</span>${whoBadge(v)}<span class="title grow">${h(v.place || '진료')}</span></div>
+    <div class="row"><span class="meta">${fmt(v.date)}</span>${whoBadge(v)}<span class="title grow">${h(v.place || '진료')}</span>${rxOf(v).length ? '<span class="badge">💊 처방약</span>' : ''}</div>
     ${v.note ? `<div class="body">${h(v.note.length > 90 ? v.note.slice(0,90) + '…' : v.note)}</div>` : ''}${thumbsHtml(v.photos)}</div>`).join('');
 }
 
@@ -474,10 +493,56 @@ function viewMeds(){
 
 /* ===== 입력 ===== */
 function whoPicker(cur){ return `<label>누구</label><div class="who" id="who">${FAMILY.map(n => `<button type="button" class="chip ${cur===n?'on':''}" data-n="${h(n)}">${h(n)}</button>`).join('')}</div>`; }
-const photoSection = label => `<label>${label}</label><div class="pick" id="pick"></div>
-  <input type="file" id="cam" accept="image/*" capture="environment" hidden><input type="file" id="gal" accept="image/*" multiple hidden>`;
+/* 사진 고르기 위젯 — 한 폼에 여러 개 둘 수 있음 (key로 구분) */
+const photoSection = (key, label) => `<label>${label}</label><div class="pick" id="pick_${key}"></div>
+  <input type="file" id="cam_${key}" accept="image/*" capture="environment" hidden><input type="file" id="gal_${key}" accept="image/*" multiple hidden>`;
 
-function openSheet(title, obj, col, inner, read){
+function photoPicker(key, initial){
+  // kept = 이미 올라간 사진, added = 이번에 고른 사진(아직 업로드 전), removed = 지울 사진
+  const kept = [...(initial || [])], added = [], removed = [];
+  const box = $('#pick_' + key);
+  const draw = () => {
+    box.innerHTML = kept.map((p,i) => `<div class="pitem"><img class="thumb" data-ph="${h(p.id)}" alt=""><button type="button" class="x" data-k="${i}">✕</button></div>`).join('')
+      + added.map((a,i) => `<div class="pitem"><img class="thumb" data-a="${i}" src="${a.url}" alt=""><button type="button" class="x" data-a="${i}">✕</button></div>`).join('')
+      + `<button type="button" class="addph" data-in="cam"><b>📷</b>촬영</button><button type="button" class="addph" data-in="gal"><b>🖼️</b>앨범</button>`;
+    hydrate(box, kept);
+    box.querySelectorAll('img[data-a]').forEach(img => img.onclick = () => viewPhoto({url: added[+img.dataset.a].url}));
+    box.querySelectorAll('.x').forEach(b => b.onclick = () => {
+      if (b.dataset.k != null) removed.push(...kept.splice(+b.dataset.k, 1));
+      else URL.revokeObjectURL(added.splice(+b.dataset.a, 1)[0].url);
+      draw();
+    });
+    box.querySelectorAll('.addph').forEach(b => b.onclick = () => $(`#${b.dataset.in}_${key}`).click());
+  };
+  const onFiles = async ev => {
+    const files = [...ev.target.files]; ev.target.value = '';
+    for (const f of files){
+      try{ const blob = await compress(f); added.push({blob, url:URL.createObjectURL(blob)}); }
+      catch(e){ $('#ferr').textContent = '이 사진 형식은 열 수 없어요. 다른 사진을 골라주세요.'; }
+    }
+    draw();
+  };
+  $('#cam_' + key).onchange = onFiles; $('#gal_' + key).onchange = onFiles;
+  draw();
+  return {
+    removed,
+    count: () => kept.length + added.length,
+    async upload(progress){
+      while (added.length){
+        progress(added.length);
+        const a = added[0], id = uid();
+        const sealed = await sealPhoto(new Uint8Array(await a.blob.arrayBuffer()));
+        await photoPut(id, sealed.bytes);
+        kept.push({id, k:sealed.k}); PHOTO_CACHE.set(id, Promise.resolve(a.url));
+        added.shift();
+      }
+      return [...kept];
+    }
+  };
+}
+
+/* 입력 시트. pickers: {key: 기존사진목록}, read(counts) → 오류문구 또는 없음, after(photosByKey) → 추가 저장 */
+function openSheet({title, obj, col, inner, pickers, read, after}){
   $('#sheet').innerHTML = `<h3>${h(title)}</h3><form id="ff">${whoPicker(obj.who)}${inner}<div class="err" id="ferr"></div>
     <div class="actions">${obj.id ? '<button type="button" class="btn danger" id="del">삭제</button>' : ''}
     <button type="button" class="btn" id="cancel">취소</button><button class="btn pri" id="save">저장</button></div></form>`;
@@ -487,82 +552,113 @@ function openSheet(title, obj, col, inner, read){
   $('#cancel').onclick = closeModal;
   if (obj.id) $('#del').onclick = () => { if (confirm('삭제할까요? (사진도 함께 삭제돼요)')){ remove(col, obj.id); closeModal(); toast('삭제했어요'); } };
 
-  // 사진: kept = 이미 올라간 사진, added = 이번에 고른 사진(아직 업로드 전)
-  const kept = [...(obj.photos || [])], added = [], removed = [];
-  const renderPick = () => {
-    $('#pick').innerHTML = kept.map((p,i) => `<div class="pitem"><img class="thumb" data-ph="${h(p.id)}" alt=""><button type="button" class="x" data-k="${i}">✕</button></div>`).join('')
-      + added.map((a,i) => `<div class="pitem"><img class="thumb" data-a="${i}" src="${a.url}" alt=""><button type="button" class="x" data-a="${i}">✕</button></div>`).join('')
-      + `<button type="button" class="addph" id="bCam"><b>📷</b>촬영</button><button type="button" class="addph" id="bGal"><b>🖼️</b>앨범</button>`;
-    hydrate($('#pick'), kept);
-    $('#pick').querySelectorAll('img[data-a]').forEach(img => img.onclick = () => viewPhoto({url: added[+img.dataset.a].url}));
-    $('#pick').querySelectorAll('.x').forEach(b => b.onclick = () => {
-      if (b.dataset.k != null) removed.push(...kept.splice(+b.dataset.k, 1));
-      else URL.revokeObjectURL(added.splice(+b.dataset.a, 1)[0].url);
-      renderPick();
-    });
-    $('#bCam').onclick = () => $('#cam').click();
-    $('#bGal').onclick = () => $('#gal').click();
-  };
-  const onFiles = async ev => {
-    const files = [...ev.target.files]; ev.target.value = '';
-    for (const f of files){
-      try{ const blob = await compress(f); added.push({blob, url:URL.createObjectURL(blob)}); }
-      catch(e){ $('#ferr').textContent = '이 사진 형식은 열 수 없어요. 다른 사진을 골라주세요.'; }
-    }
-    renderPick();
-  };
-  $('#cam').onchange = onFiles; $('#gal').onchange = onFiles;
-  renderPick();
+  const P = {};
+  for (const [k, init] of Object.entries(pickers)) P[k] = photoPicker(k, init);
 
   $('#ff').onsubmit = async ev => {
     ev.preventDefault();
-    const msg = !who ? '누구 기록인지 선택해주세요.' : read(kept.length + added.length);
+    const counts = Object.fromEntries(Object.entries(P).map(([k, p]) => [k, p.count()]));
+    const msg = !who ? '누구 기록인지 선택해주세요.' : read(counts);
     if (msg) return $('#ferr').textContent = msg;
     const btn = $('#save'); btn.disabled = true;
+    const photos = {};
     try{
-      while (added.length){
-        btn.textContent = `사진 올리는 중… (${added.length})`;
-        const a = added[0], id = uid();
-        const sealed = await sealPhoto(new Uint8Array(await a.blob.arrayBuffer()));
-        await photoPut(id, sealed.bytes);
-        kept.push({id, k:sealed.k}); PHOTO_CACHE.set(id, Promise.resolve(a.url));
-        added.shift();
-      }
+      for (const [k, p] of Object.entries(P)) photos[k] = await p.upload(() => btn.textContent = `사진 올리는 중…`);
     }catch(e){
       btn.disabled = false; btn.textContent = '저장';
       return $('#ferr').textContent = '사진 업로드 실패 (' + errText(e) + '). 인터넷 연결을 확인하고 다시 저장해주세요.';
     }
-    obj.who = who; obj.photos = kept; if (!obj.id) obj.id = uid();
-    if (!obj.photos.length) delete obj.photos;
-    upsert(col, obj); removed.forEach(p => photoDel(p.id));
+    obj.who = who; if (!obj.id) obj.id = uid();
+    obj.photos = photos.main; if (!obj.photos.length) delete obj.photos;
+    upsert(col, obj);
+    if (after) after(photos);
+    Object.values(P).forEach(p => p.removed.forEach(r => photoDel(r.id)));
     closeModal(); toast('저장했어요');
   };
 }
 function closeModal(){ $('#modal').classList.add('hidden'); $('#sheet').innerHTML = ''; }
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
 
+const rxOf = v => live('meds').filter(m => m.visitId === v.id);
+
 function editVisit(v){
   const places = [...new Set(live('visits').map(x => x.place).filter(Boolean))];
-  openSheet(v.id ? '진료 기록 수정' : '진료 기록 추가', v, 'visits', `
+  const linked = v.id ? rxOf(v).length : 0;
+  openSheet({title: v.id ? '진료 기록 수정' : '진료 기록 추가', obj:v, col:'visits', inner:`
     <label>날짜</label><input type="date" id="date" value="${h(v.date || today())}">
     <label>병원</label><input type="text" id="place" value="${h(v.place)}" placeholder="예: 서울내과 (내과)" list="pl">
     <datalist id="pl">${places.map(p => `<option value="${h(p)}">`).join('')}</datalist>
-    <label>진료 내용</label><textarea id="note" placeholder="예: 기침·미열로 방문. 기관지염 진단, 5일치 약 처방">${h(v.note)}</textarea>
+    <label>진료 내용</label><textarea id="note" placeholder="예: 기침·미열로 방문. 기관지염 진단">${h(v.note)}</textarea>
     <label>다음 예약일 (있으면)</label><input type="date" id="next" value="${h(v.next)}">
-    ${photoSection('사진 (처방전·영수증·검사지 등)')}`,
-    n => { v.date = $('#date').value; v.place = $('#place').value.trim(); v.note = $('#note').value.trim(); v.next = $('#next').value;
-           if (!v.place && !n) return '병원 이름이나 사진 중 하나는 넣어주세요.'; });
+    ${photoSection('main', '사진 (처방전·영수증·검사지 등)')}
+    <div class="rxbox">
+      ${linked ? `<div class="hint" style="margin:0 0 8px">💊 이 진료로 등록된 약 ${linked}건 — 수정은 약 탭에서</div>` : ''}
+      <label class="check"><input type="checkbox" id="rx"> 💊 ${linked ? '처방약 더 추가하기' : '처방약 받았어요 (약 탭에도 등록)'}</label>
+      <div id="rxBody" class="hidden">
+        ${photoSection('rx', '약봉지 사진')}
+        <label>약 이름 (선택)</label><input type="text" id="rxName" placeholder="예: 감기약">
+      </div>
+    </div>`,
+    pickers:{main: v.photos, rx: []},
+    read: n => {
+      v.date = $('#date').value; v.place = $('#place').value.trim(); v.note = $('#note').value.trim(); v.next = $('#next').value;
+      if (!v.place && !n.main) return '병원 이름이나 사진 중 하나는 넣어주세요.';
+      if ($('#rx').checked && !n.rx && !$('#rxName').value.trim()) return '약봉지 사진을 찍거나 약 이름을 적어주세요.';
+    },
+    after: photos => {
+      if (!$('#rx').checked) return;
+      const med = {id:uid(), who:v.who, date:v.date || today(), name:$('#rxName').value.trim(),
+                   how: v.place ? v.place + ' 처방' : '', visitId:v.id};
+      if (photos.rx.length) med.photos = photos.rx;
+      upsert('meds', med);
+    }});
+  $('#rx').onchange = () => $('#rxBody').classList.toggle('hidden', !$('#rx').checked);
 }
 function editMed(m){
-  openSheet(m.id ? '약 수정' : '약 추가', m, 'meds', `
-    ${photoSection('약봉지 · 처방전 사진')}
+  openSheet({title: m.id ? '약 수정' : '약 추가', obj:m, col:'meds', inner:`
+    ${photoSection('main', '약봉지 · 처방전 사진')}
     <div class="hint">사진만 올려도 저장돼요. 아래는 적고 싶을 때만 적으세요.</div>
     <label>약 이름 (선택)</label><input type="text" id="name" value="${h(m.name)}" placeholder="예: 혈압약, 감기약">
     <label>메모 (선택)</label><textarea id="how" style="min-height:60px" placeholder="예: 아침 1알">${h(m.how)}</textarea>
     <label>상태</label><select id="done"><option value="">지금 먹는 중</option><option value="1" ${m.done?'selected':''}>이제 안 먹음</option></select>`,
-    n => { m.name = $('#name').value.trim(); m.how = $('#how').value.trim(); m.done = !!$('#done').value;
-           if (!m.date) m.date = today();
-           if (!m.name && !n) return '약봉지 사진이나 약 이름 중 하나는 넣어주세요.'; });
+    pickers:{main: m.photos},
+    read: n => {
+      m.name = $('#name').value.trim(); m.how = $('#how').value.trim(); m.done = !!$('#done').value;
+      if (!m.date) m.date = today();
+      if (!m.name && !n.main) return '약봉지 사진이나 약 이름 중 하나는 넣어주세요.';
+    }});
+}
+
+/* ===== 병원에서 보여주기 ===== */
+function askShow(){
+  if (S.who !== 'all') return showPerson(S.who);
+  $('#sheet').innerHTML = `<h3>누구 진료인가요?</h3><div class="who big" id="sw">${FAMILY.map(n => `<button type="button" class="chip" data-n="${h(n)}">${h(n)}</button>`).join('')}</div>
+    <div class="actions"><button class="btn" id="cancel">취소</button></div>`;
+  $('#modal').classList.remove('hidden');
+  $('#cancel').onclick = closeModal;
+  $('#sw').onclick = e => { const c = e.target.closest('.chip'); if (c){ closeModal(); showPerson(c.dataset.n); } };
+}
+function showPerson(name){
+  const meds = live('meds').filter(m => m.who === name && !m.done).sort((a,b) => (b.date||'').localeCompare(a.date||''));
+  const visits = live('visits').filter(v => v.who === name).sort((a,b) => (b.date||'').localeCompare(a.date||'')).slice(0,5);
+  const el = $('#show');
+  el.innerHTML = `<div class="showin">
+    <div class="row"><h2 class="grow">${h(name)}</h2><button class="close" aria-label="닫기">✕</button></div>
+    <h3>💊 지금 먹는 약 (${meds.length})</h3>
+    ${meds.length ? meds.map(m => `<div class="sitem">
+        ${m.name || m.how ? `<div class="stxt"><b>${h(m.name)}</b> ${h(m.how)}</div>` : ''}
+        ${(m.photos||[]).map(p => `<img class="big" data-ph="${h(p.id)}" alt="">`).join('')}
+        <div class="meta">${m.date ? fmt(m.date) + ' 등록' : ''}</div></div>`).join('')
+      : '<p class="meta">지금 먹는 약 없음</p>'}
+    <h3>🏥 최근 진료</h3>
+    ${visits.length ? visits.map(v => `<div class="sitem">
+        <div class="stxt"><b>${fmt(v.date)}</b> ${h(v.place)}</div>
+        ${v.note ? `<div class="body">${h(v.note)}</div>` : ''}${thumbsHtml(v.photos, 8)}</div>`).join('')
+      : '<p class="meta">진료 기록 없음</p>'}
+    <p class="hint" style="text-align:center">사진을 누르면 크게 볼 수 있어요</p></div>`;
+  el.classList.remove('hidden'); el.scrollTop = 0;
+  hydrate(el);
+  el.querySelector('.close').onclick = () => { el.classList.add('hidden'); el.innerHTML = ''; };
 }
 
 /* ===== 설정 ===== */
